@@ -511,7 +511,7 @@ def run(
     dtype_map = {"bfloat16": torch.bfloat16, "float16": torch.float16}
     use_amp = cfg.training.get("use_amp", True)
     dtype = dtype_map.get(cfg.training.get("dtype", "float16").lower(), torch.float16)
-    scaler = GradScaler(device.type, enabled=use_amp)
+    scaler = GradScaler(device.type, enabled=use_amp and dtype == torch.float16)
     logger.info(f"Using AMP with {dtype=}" if use_amp else "AMP disabled")
 
     optimizer = LARS(
