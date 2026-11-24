@@ -246,7 +246,7 @@ class WarmupCosineScheduler:
         if epoch < self.warmup_epochs:
             lr = self.warmup_start_lr + epoch * (
                 self.base_lr - self.warmup_start_lr
-            ) / (self.warmup_epochs - 1)
+            ) / max(self.warmup_epochs - 1, 1)
         else:
             lr = self.min_lr + 0.5 * (self.base_lr - self.min_lr) * (
                 1
@@ -279,11 +279,15 @@ def train_epoch(
     """Train the SSL model for one epoch (no labels/masks are used)."""
     model.train()
 
+    # Set this epoch's learning rate *before* training, so epoch 0 starts at
+    # warmup_start_lr instead of the full base lr
+    scheduler.step(epoch)
+
     # Dynamic loss accumulator
     loss_totals = {}
 
     pbar = tqdm(train_loader, desc=f"Epoch {epoch}", disable=tqdm_silent)
-    for views in pbar:
+    for batch_idx, views in enumerate(pbar):
         view1, view2 = (
             views[0].to(device, non_blocking=True),
             views[1].to(device, non_blocking=True),
@@ -292,8 +296,20 @@ def train_epoch(
         with autocast(device.type, enabled=use_amp, dtype=dtype):
             _, z1 = model(view1)
             _, z2 = model(view2)
-            loss_dict = loss_fn(z1, z2)
-            loss = loss_dict["loss"]
+
+        # Loss in float32: the covariance/variance terms overflow float16 (max 65504)
+        loss_dict = loss_fn(z1.float(), z2.float())
+        loss = loss_dict["loss"]
+
+        if not torch.isfinite(loss):
+            parts = {k: v.item() for k, v in loss_dict.items()}
+            raise FloatingPointError(
+                f"Non-finite loss at epoch {epoch}, batch {batch_idx}: {parts} | "
+                f"inputs finite: {torch.isfinite(view1).all().item()}, "
+                f"z1 finite: {torch.isfinite(z1).all().item()}, "
+                f"|z1| max: {z1.float().abs().max().item():.3g}, "
+                f"lr: {optimizer.param_groups[0]['lr']:.3g}"
+            )
 
         optimizer.zero_grad()
         scaler.scale(loss).backward()
@@ -305,9 +321,6 @@ def train_epoch(
             loss_totals[key] = loss_totals.get(key, 0) + value.item()
 
         pbar.set_postfix({"Loss": f"{loss.item():.4f}"})
-
-    # Update learning rate
-    scheduler.step(epoch)
 
     num_batches = len(train_loader)
     return {key: total / num_batches for key, total in loss_totals.items()}
